@@ -54,29 +54,42 @@ export default function LocalMonitor() {
   // };
 
   const sendToAI = async (audioBlob: Blob) => {
-  try {
-    const formData = new FormData();
-    // 'file' must match the backend's variable name
-    formData.append('file', audioBlob, 'recording.webm');
+    setIsProcessing(true);
+    try {
+      const formData = new FormData();
+      // 'file' must match the backend's variable name
+      formData.append('file', audioBlob, 'recording.webm');
 
-    const response = await fetch('http://localhost:8000/predict', {
-      method: 'POST',
-      body: formData,
-    });
+      const response = await fetch('http://localhost:8000/predict', {
+        method: 'POST',
+        body: formData,
+      });
 
-    const result = await response.json();
-    
-    if (result.success) {
-      console.log("AI Prediction Probability:", result.probability);
-      // Here you would update your React state: 
-      // setStatus(result.is_crying ? "Crying" : "Normal");
-    } else {
-      console.error("Backend error:", result.error);
+      const result = await response.json();
+      
+      if (result.success) {
+        console.log("AI Prediction Probability:", result.probability);
+        setResult({
+          label: result.label,
+          confidence: result.confidence
+        });
+      } else {
+        console.error("Backend error:", result.error);
+        setResult({
+          label: "Error",
+          confidence: 0
+        });
+      }
+    } catch (error) {
+      console.error("Failed to connect to AI Backend. Is main.py running?", error);
+      setResult({
+        label: "Connection Error",
+        confidence: 0
+      });
+    } finally {
+      setIsProcessing(false);
     }
-  } catch (error) {
-    console.error("Failed to connect to AI Backend. Is main.py running?", error);
-  }
-};
+  };
 
   return (
     <div className="p-6 bg-white rounded-2xl shadow-xl border border-indigo-100">

@@ -1,3 +1,167 @@
+import io
+import os
+import tempfile
+import librosa
+import numpy as np
+import tensorflow as tf
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import traceback
+from pydub import AudioSegment
+
+app = FastAPI(title="Baby Monitor AI Backend")
+
+# Configure CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (React frontend, IoT devices)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================
+# 1. LOAD THE AI MODEL ON STARTUP
+# ==========================================
+print("Loading TFLite model...")
+try:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "baby_cry_v2_pro.tflite")
+    
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    print("✅ Model loaded successfully!")
+    print(f"Input shape: {input_details[0]['shape']}")
+
+except Exception as e:
+    print(f"❌ Failed to load model: {e}")
+    traceback.print_exc()
+
+
+# ==========================================
+# 2. HEALTH CHECK ENDPOINT
+# ==========================================
+@app.get("/")
+def health_check():
+    return {
+        "status": "API is live and ready", 
+        "model_loaded": "interpreter" in globals(),
+        "port": 8000
+    }
+
+
+# ==========================================
+# 3. AUDIO PREDICTION ENDPOINT (matches frontend)
+# ==========================================
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    temp_audio_path = ""
+    try:
+        # 1. Save the audio file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
+            content = await file.read()
+            temp_audio.write(content)
+            temp_audio_path = temp_audio.name
+
+        print(f"📝 Processing audio: {file.filename}")
+        
+        # 2. Try to load using pydub first (handles multiple formats)
+        try:
+            audio = AudioSegment.from_file(io.BytesIO(content))
+            audio = audio.set_frame_rate(22050).set_channels(1)
+            samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+            y = samples / (np.max(np.abs(samples)) + 1e-10)
+            sr = 22050
+        except:
+            # Fallback to librosa
+            y, sr = librosa.load(temp_audio_path, sr=22050, duration=5)
+
+        # 3. Normalize audio length to 5 seconds (110,250 samples)
+        target_length = 22050 * 5
+        if len(y) < target_length:
+            y = np.pad(y, (0, target_length - len(y)))
+        else:
+            y = y[:target_length]
+
+        # 4. Generate the Mel Spectrogram (40 mels, 216 time frames)
+        melspec = librosa.feature.melspectrogram(
+            y=y,
+            sr=sr,
+            n_mels=40,
+            n_fft=2048,
+            hop_length=512
+        )
+
+        # 5. Convert power to decibels (log scale)
+        log_melspec = librosa.power_to_db(melspec, ref=np.max)
+
+        # 6. Normalize between 0 and 1
+        log_melspec = (log_melspec - np.min(log_melspec)) / (np.max(log_melspec) - np.min(log_melspec) + 1e-10)
+
+        # 7. Ensure exactly 40x216 shape
+        if log_melspec.shape[1] < 216:
+            pad_width = 216 - log_melspec.shape[1]
+            log_melspec = np.pad(log_melspec, pad_width=((0, 0), (0, pad_width)), mode='constant')
+        else:
+            log_melspec = log_melspec[:, :216]
+
+        # 8. Reshape to model input: [1, 40, 216, 1]
+        real_input = log_melspec.reshape(1, 40, 216, 1).astype(np.float32)
+
+        # 9. Run the TFLite Model
+        interpreter.set_tensor(input_details[0]['index'], real_input)
+        interpreter.invoke()
+
+        # 10. Get the result
+        prediction = interpreter.get_tensor(output_details[0]['index'])
+        cry_probability = float(prediction[0][0])
+        
+        print(f"🎯 Prediction: {cry_probability:.4f}")
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "probability": cry_probability,
+            "is_crying": cry_probability > 0.80,
+            "label": "Crying" if cry_probability > 0.80 else "Normal",
+            "confidence": cry_probability
+        }
+
+    except Exception as e:
+        print(f"❌ Error during prediction: {e}")
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "label": "Error",
+            "confidence": 0.0
+        }
+
+    finally:
+        # 11. Clean up the temporary file
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                os.remove(temp_audio_path)
+            except:
+                pass
+
+
+# ==========================================
+# 4. RUN THE SERVER
+# ==========================================
+if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("🚀 Starting Baby Monitor AI Backend")
+    print("="*50)
+    print("📍 Server running at: http://localhost:8000")
+    print("📚 API docs at: http://localhost:8000/docs")
+    print("="*50 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 # import os
 # import tempfile
 # import librosa
