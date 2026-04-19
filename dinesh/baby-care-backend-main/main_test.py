@@ -1,92 +1,12 @@
-# from fastapi import FastAPI, UploadFile, File
-# from fastapi.middleware.cors import CORSMiddleware
-# import uvicorn
-
-# app = FastAPI(title="Baby Monitor AI Backend - Test Mode")
-
-# # Configure CORS for React frontend
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # ==========================================
-# # HEALTH CHECK ENDPOINT
-# # ==========================================
-# @app.get("/")
-# def health_check():
-#     return {
-#         "status": "API is live and ready",
-#         "mode": "test-mode (TensorFlow installation issue - using mock predictions)",
-#         "port": 8000
-#     }
-
-
-# # ==========================================
-# # AUDIO PREDICTION ENDPOINT (TEST)
-# # ==========================================
-# @app.post("/predict")
-# async def predict(file: UploadFile = File(...)):
-#     """
-#     Test endpoint that returns mock predictions while we fix TensorFlow.
-#     The return format matches what the frontend expects.
-#     """
-#     try:
-#         print(f"📝 Received audio: {file.filename}")
-        
-#         # Mock prediction (in real implementation, this uses the TFLite model)
-#         # Randomly return a crying or normal result for testing
-#         import random
-#         mock_probability = random.uniform(0.2, 0.95)
-        
-#         return {
-#             "success": True,
-#             "filename": file.filename,
-#             "probability": mock_probability,
-#             "is_crying": mock_probability > 0.80,
-#             "label": "Crying" if mock_probability > 0.80 else "Normal",
-#             "confidence": mock_probability,
-#             "mode": "TEST - Returns Mock Data"
-#         }
-
-#     except Exception as e:
-#         print(f"❌ Error: {e}")
-#         return {
-#             "success": False,
-#             "error": str(e),
-#             "label": "Error",
-#             "confidence": 0.0
-#         }
-
-
-# # ==========================================
-# # RUN THE SERVER
-# # ==========================================
-# if __name__ == "__main__":
-#     print("\n" + "="*60)
-#     print("🚀 Baby Monitor AI Backend - TEST MODE")
-#     print("="*60)
-#     print("⚠️  Running in test mode (mock predictions)")
-#     print("📍 Server running at: http://localhost:8000")
-#     print("📚 API docs at: http://localhost:8000/docs")
-#     print("="*60 + "\n")
-    
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
 import numpy as np
 import librosa
 import pyaudio
 import threading
 import cv2
 import os
+import time
 import uvicorn
+import pygame
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -96,7 +16,8 @@ latest_detection = {
     "label": "Initializing...",
     "confidence": 0.0,
     "is_crying": False,
-    "status": "Listening"
+    "status": "Listening",
+    "time_until_music": 0.0  # Added field for the countdown
 }
 
 # --- Import Logic for TFLite ---
@@ -127,7 +48,19 @@ if tflite and os.path.exists(MODEL_PATH):
 # --- Audio Config ---
 RATE = 22050
 CHUNK = 1024
-DURATION = 5  # Analyze 5-second sliding windows
+DURATION = 4  # Analyze 5-second sliding windows
+
+
+# --- Music Config ---
+pygame.mixer.init()
+SONG_PATH = "baby_track.mp3"
+CRY_TIME_THRESHOLD = 5.0  # Seconds of continuous crying required to play music
+
+# Pre-load song if it exists
+if os.path.exists(SONG_PATH):
+    pygame.mixer.music.load(SONG_PATH)
+else:
+    print(f"⚠️ Warning: {SONG_PATH} not found. Music will not play.")
 
 def process_audio(audio_data):
     """Processes audio buffer and returns AI prediction"""
@@ -171,6 +104,9 @@ def mic_loop():
     global latest_detection
     p = pyaudio.PyAudio()
     
+    # Track when the crying started
+    crying_start_time = None
+    
     try:
         stream = p.open(format=pyaudio.paFloat32, channels=1, rate=RATE, 
                         input=True, frames_per_buffer=CHUNK)
@@ -191,18 +127,48 @@ def mic_loop():
             buffer = np.roll(buffer, -len(new_samples))
             buffer[-len(new_samples):] = new_samples
             
-            # Process and update global state
+            # Process AI prediction
             label, conf = process_audio(buffer)
+            is_crying = (label == "Baby Crying")
+            
+            time_until_music = 0.0
+            
+            # --- TIMER AND MUSIC LOGIC ---
+            if is_crying:
+                if crying_start_time is None:
+                    # Start the timer
+                    crying_start_time = time.time()
+                    time_until_music = float(CRY_TIME_THRESHOLD)
+                else:
+                    # Calculate elapsed and remaining time
+                    elapsed_crying_time = time.time() - crying_start_time
+                    time_until_music = max(0.0, CRY_TIME_THRESHOLD - elapsed_crying_time)
+                    
+                    if elapsed_crying_time > CRY_TIME_THRESHOLD:
+                        # If crying > 10s and music isn't already playing, play music
+                        if not pygame.mixer.music.get_busy() and os.path.exists(SONG_PATH):
+                            print(f"\n🎶 Baby has been crying for {CRY_TIME_THRESHOLD}s. Playing lullaby...")
+                            pygame.mixer.music.play()
+            else:
+                # If baby stops crying, reset the timer
+                crying_start_time = None
+                time_until_music = 0.0
+
+            # Update global state (Frontend can access time_until_music here)
             latest_detection = {
                 "label": label,
                 "confidence": round(conf, 2),
-                "is_crying": label == "Baby Crying",
-                "status": "Monitoring"
+                "is_crying": is_crying,
+                "status": "Monitoring",
+                "time_until_music": round(time_until_music, 1)
             }
             
-            # Print Alert to Terminal
-            if latest_detection["is_crying"]:
-                print(f"🚨 ALERT: Baby Crying! ({conf:.1f}%)")
+            # Print Alert & Countdown to Terminal
+            if is_crying:
+                if pygame.mixer.music.get_busy():
+                    print(f"🚨 ALERT: Baby Crying! ({conf:.1f}%) - 🎶 Lullaby is currently playing.")
+                else:
+                    print(f"🚨 ALERT: Baby Crying! ({conf:.1f}%) - ⏳ Lullaby in {time_until_music:.1f}s")
 
     except Exception as e:
         print(f"❌ Microphone Error: {e}")
@@ -223,7 +189,9 @@ app.add_middleware(
 @app.get("/status")
 async def get_status():
     """Endpoint for frontend to poll real-time status"""
-    return latest_detection
+    response_data = latest_detection.copy()
+    response_data["music_playing"] = pygame.mixer.music.get_busy()
+    return response_data
 
 @app.get("/")
 async def health():
@@ -235,5 +203,4 @@ if __name__ == "__main__":
     
     # Start FastAPI server
     print(f"🚀 Server starting at http://localhost:8000")
-    print(f"📖 Based on Reference [1]: Rupali P. et al., 2025")
     uvicorn.run(app, host="0.0.0.0", port=8000)
